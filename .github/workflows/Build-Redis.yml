@@ -42,7 +42,7 @@ jobs:
 
     - name: Locate solution file
       run: |
-        dir /s /b *.sln
+        Get-ChildItem -Path . -Recurse -Filter *.sln
 
     - name: Build
       run: |
