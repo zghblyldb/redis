@@ -40,9 +40,13 @@ jobs:
     - name: Set up MSBuild
       uses: microsoft/setup-msbuild@v1
 
+    - name: Locate solution file
+      run: |
+        dir /s /b *.sln
+
     - name: Build
       run: |
-        msbuild /p:Configuration=Release
+        msbuild deps/jemalloc/msvc/jemalloc_vc2015.sln /p:Configuration=Release
 
     - name: Package
       run: |
