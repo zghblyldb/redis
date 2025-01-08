@@ -46,7 +46,7 @@ jobs:
 
     - name: Build
       run: |
-        msbuild deps/jemalloc/msvc/jemalloc_vc2015.sln /p:Configuration=Release
+        msbuild deps/jemalloc/msvc/jemalloc_vc2017.sln /p:Configuration=Release
 
     - name: Package
       run: |
