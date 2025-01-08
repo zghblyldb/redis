@@ -1,0 +1,58 @@
+name: Build and Package
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Set up C
+      uses: actions/setup-c@v1
+
+    - name: Build
+      run: |
+        make
+
+    - name: Package
+      run: |
+        tar -czvf redis-linux.tar.gz .
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: redis-linux
+        path: redis-linux.tar.gz
+
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Set up MSBuild
+      uses: microsoft/setup-msbuild@v1
+
+    - name: Build
+      run: |
+        msbuild /p:Configuration=Release
+
+    - name: Package
+      run: |
+        tar -czvf redis-windows.tar.gz .
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: redis-windows
+        path: redis-windows.tar.gz
