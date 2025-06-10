@@ -7,8 +7,9 @@
  * Copyright (c) 2017-Present, Redis Ltd.
  * All rights reserved.
  *
- * Licensed under your choice of the Redis Source Available License 2.0
- * (RSALv2) or the Server Side Public License v1 (SSPLv1).
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #include <stdint.h>
@@ -229,6 +230,11 @@ unsigned char *lpNew(size_t capacity) {
 /* Free the specified listpack. */
 void lpFree(unsigned char *lp) {
     lp_free(lp);
+}
+
+/* Generic version of lpFree. */
+void lpFreeGeneric(void *lp) {
+    lp_free((unsigned char *)lp);
 }
 
 /* Shrink the memory to fit. */
@@ -3120,7 +3126,7 @@ int listpackTest(int argc, char *argv[], int flags) {
         for (i = 0; i < iteration; i++) {
             lp = lpNew(0);
             ref = listCreate();
-            listSetFreeMethod(ref,(void (*)(void*))sdsfree);
+            listSetFreeMethod(ref, sdsfreegeneric);
             len = rand() % 256;
 
             /* Create lists */

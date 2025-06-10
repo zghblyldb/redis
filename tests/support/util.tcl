@@ -1,3 +1,17 @@
+#
+# Copyright (c) 2009-Present, Redis Ltd.
+# All rights reserved.
+#
+# Copyright (c) 2024-present, Valkey contributors.
+# All rights reserved.
+#
+# Licensed under your choice of (a) the Redis Source Available License 2.0
+# (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+# GNU Affero General Public License v3 (AGPLv3).
+#
+# Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
+#
+
 proc randstring {min max {type binary}} {
     set len [expr {$min+int(rand()*($max-$min+1))}]
     set output {}
@@ -56,8 +70,12 @@ proc sanitizer_errors_from_file {filename} {
     set lines [split [exec cat $filename] "\n"]
 
     foreach line $lines {
-        # Ignore huge allocation warnings
+        # Ignore huge allocation warnings for both ASan and MSan
         if ([string match {*WARNING: AddressSanitizer failed to allocate*} $line]) {
+            continue
+        }
+
+        if ([string match {*WARNING: MemorySanitizer failed to allocate*} $line]) {
             continue
         }
 
@@ -118,11 +136,11 @@ proc wait_for_sync r {
     }
 }
 
-proc wait_replica_online r {
-    wait_for_condition 50 100 {
-        [string match "*slave0:*,state=online*" [$r info replication]]
+proc wait_replica_online {r {replica_id 0} {maxtries 50} {delay 100}} {
+    wait_for_condition $maxtries $delay {
+        [string match "*slave$replica_id:*,state=online*" [$r info replication]]
     } else {
-        fail "replica didn't online in time"
+        fail "replica $replica_id did not become online in time"
     }
 }
 
@@ -565,10 +583,11 @@ proc find_valgrind_errors {stderr on_termination} {
 }
 
 # Execute a background process writing random data for the specified number
-# of seconds to the specified Redis instance.
-proc start_write_load {host port seconds} {
+# of seconds to the specified Redis instance. If key is omitted, a random key
+# is used for every SET command.
+proc start_write_load {host port seconds {key ""} {size 0} {sleep 0}} {
     set tclsh [info nameofexecutable]
-    exec $tclsh tests/helpers/gen_write_load.tcl $host $port $seconds $::tls &
+    exec $tclsh tests/helpers/gen_write_load.tcl $host $port $seconds $::tls $key $size $sleep &
 }
 
 # Stop a process generating write load executed with start_write_load.
@@ -677,6 +696,12 @@ proc pause_process pid {
 }
 
 proc resume_process pid {
+    wait_for_condition 50 1000 {
+        [string match "T*" [exec ps -o state= -p $pid]]
+    } else {
+        puts [exec ps j $pid]
+        fail "process was not stopped"
+    }
     exec kill -SIGCONT $pid
 }
 
@@ -717,7 +742,8 @@ proc generate_fuzzy_traffic_on_key {key type duration} {
     set list_commands {LINDEX LINSERT LLEN LPOP LPOS LPUSH LPUSHX LRANGE LREM LSET LTRIM RPOP RPOPLPUSH RPUSH RPUSHX}
     set set_commands {SADD SCARD SDIFF SDIFFSTORE SINTER SINTERSTORE SISMEMBER SMEMBERS SMOVE SPOP SRANDMEMBER SREM SSCAN SUNION SUNIONSTORE}
     set stream_commands {XACK XADD XCLAIM XDEL XGROUP XINFO XLEN XPENDING XRANGE XREAD XREADGROUP XREVRANGE XTRIM}
-    set commands [dict create string $string_commands hash $hash_commands zset $zset_commands list $list_commands set $set_commands stream $stream_commands]
+    set vset_commands {VADD VREM}
+    set commands [dict create string $string_commands hash $hash_commands zset $zset_commands list $list_commands set $set_commands stream $stream_commands vectorset $vset_commands]
 
     set cmds [dict get $commands $type]
     set start_time [clock seconds]
@@ -767,6 +793,18 @@ proc generate_fuzzy_traffic_on_key {key type duration} {
             lappend cmd [randomValue]
             incr i 4
         }
+        if {$cmd == "VADD"} {
+            lappend cmd $key
+            lappend cmd VALUES 3 1 1 1
+            lappend cmd [randomValue]
+            incr i 7
+        }
+        if {$cmd == "VREM"} {
+            lappend cmd $key
+            lappend cmd [randomValue]
+            incr i 2
+        }
+
         for {} {$i < $arity} {incr i} {
             if {$i == $firstkey || $i == $lastkey} {
                 lappend cmd $key
@@ -1123,6 +1161,15 @@ proc memory_usage {key} {
     return $usage
 }
 
+# Test if the server supports the specified command.
+proc server_has_command {cmd_wanted} {
+    set lowercase_commands {}
+    foreach cmd [r command list] {
+        lappend lowercase_commands [string tolower $cmd]
+    }
+    expr {[lsearch $lowercase_commands [string tolower $cmd_wanted]] != -1}
+}
+
 # forward compatibility, lmap missing in TCL 8.5
 proc lmap args {
     set body [lindex $args end]
@@ -1155,6 +1202,12 @@ proc format_command {args} {
 
 # Returns whether or not the system supports stack traces
 proc system_backtrace_supported {} {
+    # Thread sanitizer reports backtrace_symbols_fd() as
+    # signal-unsafe since it allocates memory
+    if {$::tsan} {
+        return 0
+    }
+
     set system_name [string tolower [exec uname -s]]
     if {$system_name eq {darwin}} {
         return 1

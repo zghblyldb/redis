@@ -2,8 +2,9 @@
  * Copyright (c) 2011-Present, Redis Ltd.
  * All rights reserved.
  *
- * Licensed under your choice of the Redis Source Available License 2.0
- * (RSALv2) or the Server Side Public License v1 (SSPLv1).
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #include "functions.h"
@@ -142,6 +143,10 @@ static void engineLibraryFree(functionLibInfo* li) {
     sdsfree(li->name);
     sdsfree(li->code);
     zfree(li);
+}
+
+static void engineLibraryFreeGeneric(void *li) {
+    engineLibraryFree((functionLibInfo *)li);
 }
 
 static void engineLibraryDispose(dict *d, void *obj) {
@@ -338,7 +343,7 @@ static int libraryJoin(functionsLibCtx *functions_lib_ctx_dst, functionsLibCtx *
             } else {
                 if (!old_libraries_list) {
                     old_libraries_list = listCreate();
-                    listSetFreeMethod(old_libraries_list, (void (*)(void*))engineLibraryFree);
+                    listSetFreeMethod(old_libraries_list, engineLibraryFreeGeneric);
                 }
                 libraryUnlink(functions_lib_ctx_dst, old_li);
                 listAddNodeTail(old_libraries_list, old_li);

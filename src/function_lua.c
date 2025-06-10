@@ -2,8 +2,9 @@
  * Copyright (c) 2021-Present, Redis Ltd.
  * All rights reserved.
  *
- * Licensed under your choice of the Redis Source Available License 2.0
- * (RSALv2) or the Server Side Public License v1 (SSPLv1).
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 /*
@@ -198,6 +199,7 @@ static void luaEngineFreeCtx(void *engine_ctx) {
     unsigned int lua_tcache = (unsigned int)(uintptr_t)ud;
 #endif
 
+    lua_gc(lua_engine_ctx->lua, LUA_GCCOLLECT, 0);
     lua_close(lua_engine_ctx->lua);
     zfree(lua_engine_ctx);
 
