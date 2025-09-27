@@ -2,6 +2,9 @@
  * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
+ * Copyright (c) 2024-present, Valkey contributors.
+ * All rights reserved.
+ *
  * Licensed under your choice of (a) the Redis Source Available License 2.0
  * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
  * GNU Affero General Public License v3 (AGPLv3).
@@ -17,6 +20,7 @@
 
 #include "server.h"
 #include "cluster.h"
+#include "cluster_slot_stats.h"
 
 #include <ctype.h>
 
@@ -52,6 +56,18 @@ int patternHashSlot(char *pattern, int length) {
 
     /* The pattern matches a single key. Hash the whole pattern. */
     return crc16(pattern, length) & 0x3FFF;
+}
+
+int getSlotOrReply(client *c, robj *o) {
+    long long slot;
+
+    if (getLongLongFromObject(o,&slot) != C_OK ||
+        slot < 0 || slot >= CLUSTER_SLOTS)
+    {
+        addReplyError(c,"Invalid or out of range slot");
+        return -1;
+    }
+    return (int) slot;
 }
 
 ConnectionType *connTypeOfCluster(void) {
@@ -191,7 +207,9 @@ void restoreCommand(client *c) {
 
     /* Make sure this key does not already exist here... */
     robj *key = c->argv[1];
-    if (!replace && lookupKeyWrite(c->db,key) != NULL) {
+    kvobj *oldval = lookupKeyWrite(c->db,key);
+    int oldtype = oldval ? oldval->type : -1;
+    if (!replace && oldval) {
         addReplyErrorObject(c,shared.busykeyerr);
         return;
     }
@@ -239,18 +257,17 @@ void restoreCommand(client *c) {
     }
 
     /* Create the key and set the TTL if any */
-    kvobj *kv = dbAdd(c->db, key, &obj);
+    kvobj *kv = dbAddInternal(c->db, key, &obj, NULL, ttl ? ttl : -1);
 
     /* If minExpiredField was set, then the object is hash with expiration
      * on fields and need to register it in global HFE DS */
     if (kv->type == OBJ_HASH) {
         uint64_t minExpiredField = hashTypeGetMinExpire(kv, 1);
         if (minExpiredField != EB_EXPIRE_TIME_INVALID)
-            hashTypeAddToExpires(c->db, kv, minExpiredField);
+            estoreAdd(c->db->subexpires, getKeySlot(key->ptr), kv, minExpiredField);
     }
 
     if (ttl) {
-        kv = setExpire(c,c->db,key,ttl); /* might realloc kvobj */
         if (!absttl) {
             /* Propagate TTL as absolute timestamp */
             robj *ttl_obj = createStringObjectFromLongLong(ttl);
@@ -262,6 +279,15 @@ void restoreCommand(client *c) {
     objectSetLRUOrLFU(kv, lfu_freq, lru_idle, lru_clock, 1000);
     signalModifiedKey(c,c->db,key);
     notifyKeyspaceEvent(NOTIFY_GENERIC,"restore",key,c->db->id);
+ 
+    /* If we deleted a key that means REPLACE parameter was passed and the
+     * destination key existed. */
+    if (deleted) {
+        notifyKeyspaceEvent(NOTIFY_OVERWRITTEN, "overwritten", key, c->db->id);
+        if (oldtype != kv->type) {
+            notifyKeyspaceEvent(NOTIFY_TYPE_CHANGED, "type_changed", key, c->db->id);
+        }
+    }
     addReply(c,shared.ok);
     server.dirty++;
 }
@@ -359,10 +385,11 @@ void migrateCloseSocket(robj *host, robj *port) {
 }
 
 void migrateCloseTimedoutSockets(void) {
-    dictIterator *di = dictGetSafeIterator(server.migrate_cached_sockets);
+    dictIterator di;
     dictEntry *de;
 
-    while((de = dictNext(di)) != NULL) {
+    dictInitSafeIterator(&di, server.migrate_cached_sockets);
+    while((de = dictNext(&di)) != NULL) {
         migrateCachedSocket *cs = dictGetVal(de);
 
         if ((server.unixtime - cs->last_use_time) > MIGRATE_SOCKET_CACHE_TTL) {
@@ -371,7 +398,7 @@ void migrateCloseTimedoutSockets(void) {
             dictDelete(server.migrate_cached_sockets,dictGetKey(de));
         }
     }
-    dictReleaseIterator(di);
+    dictResetIterator(&di);
 }
 
 /* MIGRATE host port key dbid timeout [COPY | REPLACE | AUTH password |
@@ -930,6 +957,8 @@ void clusterCommandHelp(client *c) {
             "SLOTS",
             "    Return information about slots range mappings. Each range is made of:",
             "    start, end, master and replicas IP addresses, ports and ids",
+            "SLOT-STATS",
+            "    Return an array of slot usage statistics for slots assigned to the current node.",
             "SHARDS",
             "    Return information about slot range mappings and the nodes associated with them.",
             NULL
@@ -1349,7 +1378,7 @@ int clusterRedirectBlockedClientIfNeeded(client *c) {
          c->bstate.btype == BLOCKED_MODULE))
     {
         dictEntry *de;
-        dictIterator *di;
+        dictIterator di;
 
         /* If the cluster is down, unblock the client with the right error.
          * If the cluster is configured to allow reads on cluster down, we
@@ -1366,8 +1395,8 @@ int clusterRedirectBlockedClientIfNeeded(client *c) {
             return 0;
 
         /* All keys must belong to the same slot, so check first key only. */
-        di = dictGetIterator(c->bstate.keys);
-        if ((de = dictNext(di)) != NULL) {
+        dictInitIterator(&di, c->bstate.keys);
+        if ((de = dictNext(&di)) != NULL) {
             robj *key = dictGetKey(de);
             int slot = keyHashSlot((char*)key->ptr, sdslen(key->ptr));
             clusterNode *node = getNodeBySlot(slot);
@@ -1393,11 +1422,11 @@ int clusterRedirectBlockedClientIfNeeded(client *c) {
                     clusterRedirectClient(c,node,slot,
                                           CLUSTER_REDIR_MOVED);
                 }
-                dictReleaseIterator(di);
+                dictResetIterator(&di);
                 return 1;
             }
         }
-        dictReleaseIterator(di);
+        dictResetIterator(&di);
     }
     return 0;
 }
@@ -1687,4 +1716,13 @@ void readwriteCommand(client *c) {
     }
     c->flags &= ~CLIENT_READONLY;
     addReply(c,shared.ok);
+}
+
+/* Resets transient cluster stats that we expose via INFO or other means that we want
+ * to reset via CONFIG RESETSTAT. The function is also used in order to
+ * initialize these fields in clusterInit() at server startup. */
+void resetClusterStats(void) {
+    if (!server.cluster_enabled) return;
+
+    clusterSlotStatResetAll();
 }

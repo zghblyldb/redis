@@ -880,26 +880,26 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
         /* Save a set value */
         if (o->encoding == OBJ_ENCODING_HT) {
             dict *set = o->ptr;
-            dictIterator *di = dictGetIterator(set);
+            dictIterator di;
             dictEntry *de;
 
             if ((n = rdbSaveLen(rdb,dictSize(set))) == -1) {
-                dictReleaseIterator(di);
                 return -1;
             }
             nwritten += n;
 
-            while((de = dictNext(di)) != NULL) {
+            dictInitIterator(&di, set);
+            while((de = dictNext(&di)) != NULL) {
                 sds ele = dictGetKey(de);
                 if ((n = rdbSaveRawString(rdb,(unsigned char*)ele,sdslen(ele)))
                     == -1)
                 {
-                    dictReleaseIterator(di);
+                    dictResetIterator(&di);
                     return -1;
                 }
                 nwritten += n;
             }
-            dictReleaseIterator(di);
+            dictResetIterator(&di);
         } else if (o->encoding == OBJ_ENCODING_INTSET) {
             size_t l = intsetBlobLen((intset*)o->ptr);
 
@@ -969,7 +969,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
             nwritten += n;
         } else if (o->encoding == OBJ_ENCODING_HT) {
             int hashWithMeta = 0;  /* RDB_TYPE_HASH_METADATA */
-            dictIterator *di = dictGetIterator(o->ptr);
+            dictIterator di;
             dictEntry *de;
             /* Determine the hash layout to use based on the presence of at least
              * one field with a valid TTL. If such a field exists, employ the
@@ -983,20 +983,19 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
                 hashWithMeta = 1;
                 /* Save next field expire time of hash */
                 if (rdbSaveMillisecondTime(rdb, minExpire) == -1) {
-                    dictReleaseIterator(di);
                     return -1;
                 }
             }
 
             /* save number of fields in hash */
             if ((n = rdbSaveLen(rdb,dictSize((dict*)o->ptr))) == -1) {
-                dictReleaseIterator(di);
                 return -1;
             }
             nwritten += n;
 
             /* save all hash fields */
-            while((de = dictNext(di)) != NULL) {
+            dictInitIterator(&di, o->ptr);
+            while((de = dictNext(&di)) != NULL) {
                 hfield field = dictGetKey(de);
                 sds value = dictGetVal(de);
 
@@ -1010,7 +1009,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
                      */
                     ttl = (expiryTime == EB_EXPIRE_TIME_INVALID) ? 0 : expiryTime - minExpire + 1;
                     if ((n = rdbSaveLen(rdb, ttl)) == -1) {
-                        dictReleaseIterator(di);
+                        dictResetIterator(&di);
                         return -1;
                     }
                     nwritten += n;
@@ -1020,7 +1019,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
                 if ((n = rdbSaveRawString(rdb,(unsigned char*)field,
                         hfieldlen(field))) == -1)
                 {
-                    dictReleaseIterator(di);
+                    dictResetIterator(&di);
                     return -1;
                 }
                 nwritten += n;
@@ -1029,12 +1028,12 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
                 if ((n = rdbSaveRawString(rdb,(unsigned char*)value,
                         sdslen(value))) == -1)
                 {
-                    dictReleaseIterator(di);
+                    dictResetIterator(&di);
                     return -1;
                 }
                 nwritten += n;
             }
-            dictReleaseIterator(di);
+            dictResetIterator(&di);
         } else {
             serverPanic("Unknown hash encoding");
         }
@@ -1349,22 +1348,24 @@ error:
 
 ssize_t rdbSaveFunctions(rio *rdb) {
     dict *functions = functionsLibGet();
-    dictIterator *iter = dictGetIterator(functions);
+    dictIterator iter;
     dictEntry *entry = NULL;
     ssize_t written = 0;
     ssize_t ret;
-    while ((entry = dictNext(iter))) {
+
+    dictInitIterator(&iter, functions);
+    while ((entry = dictNext(&iter))) {
         if ((ret = rdbSaveType(rdb, RDB_OPCODE_FUNCTION2)) < 0) goto werr;
         written += ret;
         functionLibInfo *li = dictGetVal(entry);
         if ((ret = rdbSaveRawString(rdb, (unsigned char *) li->code, sdslen(li->code))) < 0) goto werr;
         written += ret;
     }
-    dictReleaseIterator(iter);
+    dictResetIterator(&iter);
     return written;
 
 werr:
-    dictReleaseIterator(iter);
+    dictResetIterator(&iter);
     return -1;
 }
 
@@ -2156,7 +2157,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
 
         /* Too many entries? Use a hash table right from the start. */
         if (len > server.hash_max_listpack_entries)
-            hashTypeConvert(o, OBJ_ENCODING_HT, NULL);
+            hashTypeConvert(NULL, o, OBJ_ENCODING_HT);
         else if (deep_integrity_validation) {
             /* In this mode, we need to guarantee that the server won't crash
              * later when the ziplist is converted to a dict.
@@ -2200,7 +2201,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 sdslen(value) > server.hash_max_listpack_value ||
                 !lpSafeToAdd(o->ptr, hfieldlen(field) + sdslen(value)))
             {
-                hashTypeConvert(o, OBJ_ENCODING_HT, NULL);
+                hashTypeConvert(NULL, o, OBJ_ENCODING_HT);
                 dictUseStoredKeyApi((dict *)o->ptr, 1);
                 ret = dictAdd((dict*)o->ptr, field, value);
                 dictUseStoredKeyApi((dict *)o->ptr, 0);
@@ -2283,7 +2284,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
         if (rdbtype == RDB_TYPE_HASH_METADATA) {
             minExpire = rdbLoadMillisecondTime(rdb, RDB_VERSION);
             if (rioGetReadError(rdb)) {
-                rdbReportCorruptRDB("Hash failed loading minExpire");
+                rdbReportReadError("Hash failed loading minExpire");
                 return NULL;
             }
             if (minExpire > EB_EXPIRE_TIME_INVALID) {
@@ -2298,11 +2299,11 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
         o = createHashObject();
         /* Too many entries? Use a hash table right from the start. */
         if (len > server.hash_max_listpack_entries) {
-            hashTypeConvert(o, OBJ_ENCODING_HT, NULL);
+            hashTypeConvert(NULL, o, OBJ_ENCODING_HT);
             dictTypeAddMeta((dict**)&o->ptr, &mstrHashDictTypeWithHFE);
             initDictExpireMetadata(o);
         } else {
-            hashTypeConvert(o, OBJ_ENCODING_LISTPACK_EX, NULL);
+            hashTypeConvert(NULL, o, OBJ_ENCODING_LISTPACK_EX);
             if (deep_integrity_validation) {
                 /* In this mode, we need to guarantee that the server won't crash
                 * later when the listpack is converted to a dict.
@@ -2387,7 +2388,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                     !lpSafeToAdd(((listpackEx*)o->ptr)->lp, hfieldlen(field) + sdslen(value) + lpEntrySizeInteger(expireAt)))
                 {
                     /* convert to hash */
-                    hashTypeConvert(o, OBJ_ENCODING_HT, NULL);
+                    hashTypeConvert(NULL, o, OBJ_ENCODING_HT);
 
                     if (len > DICT_HT_INITIAL_SIZE) { /* TODO: this is NOT the original len, but this is also the case for simple hash, is this a bug? */
                         if (dictTryExpand(o->ptr, len) != DICT_OK) {
@@ -2529,7 +2530,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
              * directly to FLASH (while keeping in mem its next expiration time) */
             UNUSED(minExpire);
             if (rioGetReadError(rdb)) {
-                rdbReportCorruptRDB( "Hash listpackex integrity check failed.");
+                rdbReportReadError( "Short read of listpackex min expiration time.");
                 return NULL;
             }
         }
@@ -2597,7 +2598,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                     if (hashTypeLength(o, 0) > server.hash_max_listpack_entries ||
                         maxlen > server.hash_max_listpack_value)
                     {
-                        hashTypeConvert(o, OBJ_ENCODING_HT, NULL);
+                        hashTypeConvert(NULL, o, OBJ_ENCODING_HT);
                     }
                 }
                 break;
@@ -2734,7 +2735,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                     }
 
                     if (hashTypeLength(o, 0) > server.hash_max_listpack_entries)
-                        hashTypeConvert(o, OBJ_ENCODING_HT, NULL);
+                        hashTypeConvert(NULL, o, OBJ_ENCODING_HT);
                     else
                         o->ptr = lpShrinkToFit(o->ptr);
                     break;
@@ -2775,7 +2776,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 /* Convert listpack to hash table without registering in global HFE DS,
                  * if has HFEs, since the listpack is not connected yet to the DB */
                 if (hashTypeLength(o, 0) > server.hash_max_listpack_entries)
-                    hashTypeConvert(o, OBJ_ENCODING_HT, NULL /*db->hexpires*/);
+                    hashTypeConvert(NULL /*db*/, o, OBJ_ENCODING_HT);
 
                 break;
             default:
@@ -2973,6 +2974,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 streamNACK *nack = streamCreateNACK(NULL);
                 nack->delivery_time = rdbLoadMillisecondTime(rdb,RDB_VERSION);
                 nack->delivery_count = rdbLoadLen(rdb,NULL);
+                nack->cgroup_ref_node = streamLinkCGroupToEntry(s, cgroup, rawid);
                 if (rioGetReadError(rdb)) {
                     rdbReportReadError("Stream PEL NACK loading failed.");
                     decrRefCount(o);
@@ -3208,15 +3210,13 @@ void startLoadingFile(size_t size, char* filename, int rdbflags) {
 /* Refresh the absolute loading progress info */
 void loadingAbsProgress(off_t pos) {
     server.loading_loaded_bytes = pos;
-    if (server.stat_peak_memory < zmalloc_used_memory())
-        server.stat_peak_memory = zmalloc_used_memory();
+    updatePeakMemory(zmalloc_used_memory());
 }
 
 /* Refresh the incremental loading progress info */
 void loadingIncrProgress(off_t size) {
     server.loading_loaded_bytes += size;
-    if (server.stat_peak_memory < zmalloc_used_memory())
-        server.stat_peak_memory = zmalloc_used_memory();
+    updatePeakMemory(zmalloc_used_memory());
 }
 
 /* Update the file name currently being loaded */
@@ -3649,7 +3649,7 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
             if (kv->type == OBJ_HASH) {
                 uint64_t minExpiredField = hashTypeGetMinExpire(kv, 1);
                 if (minExpiredField != EB_EXPIRE_TIME_INVALID)
-                    hashTypeAddToExpires(db, kv, minExpiredField);
+                    estoreAdd(db->subexpires, getKeySlot(key), kv, minExpiredField);
             }
 
             /* Set usage information (for eviction). */

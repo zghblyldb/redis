@@ -15,6 +15,7 @@
 #include "server.h"
 #include "atomicvar.h"
 #include "cluster.h"
+#include "cluster_slot_stats.h"
 #include "script.h"
 #include "fpconv_dtoa.h"
 #include "fmtargs.h"
@@ -212,6 +213,7 @@ client *createClient(connection *conn) {
     c->postponed_list_node = NULL;
     c->client_tracking_redirection = 0;
     c->client_tracking_prefixes = NULL;
+    c->last_cron_check_time = 0;
     c->last_memory_usage = 0;
     c->last_memory_type = CLIENT_TYPE_NORMAL;
     c->module_blocked_client = NULL;
@@ -222,6 +224,8 @@ client *createClient(connection *conn) {
     listInitNode(&c->clients_pending_write_node, c);
     c->mem_usage_bucket = NULL;
     c->mem_usage_bucket_node = NULL;
+    c->net_input_bytes_curr_cmd = 0;
+    c->net_output_bytes_curr_cmd = 0;
     if (conn) linkClient(c);
     initClientMultiState(c);
     c->net_input_bytes = 0;
@@ -400,6 +404,7 @@ void _addReplyToBufferOrList(client *c, const char *s, size_t len) {
         return;
     }
 
+    c->net_output_bytes_curr_cmd += len;
     /* We call it here because this function may affect the reply
      * buffer offset (see function comment) */
     reqresSaveClientReplyOffset(c);
@@ -791,6 +796,7 @@ void setDeferredReply(client *c, void *node, const char *s, size_t length) {
         if (len_to_copy > length)
             len_to_copy = length;
         memcpy(prev->buf + prev->used, s, len_to_copy);
+        c->net_output_bytes_curr_cmd += len_to_copy;
         prev->used += len_to_copy;
         length -= len_to_copy;
         if (length == 0) {
@@ -806,6 +812,7 @@ void setDeferredReply(client *c, void *node, const char *s, size_t length) {
     {
         memmove(next->buf + length, next->buf, next->used);
         memcpy(next->buf, s, length);
+        c->net_output_bytes_curr_cmd += length;
         next->used += length;
         listDelNode(c->reply,ln);
     } else {
@@ -816,6 +823,7 @@ void setDeferredReply(client *c, void *node, const char *s, size_t length) {
         buf->size = usable_size - sizeof(clientReplyBlock);
         buf->used = length;
         memcpy(buf->buf, s, length);
+        c->net_output_bytes_curr_cmd += length;
         listNodeValue(ln) = buf;
         c->reply_bytes += buf->size;
 
@@ -2315,6 +2323,9 @@ static inline void resetClientInternal(client *c, int free_argv) {
         c->flags |= CLIENT_REPLY_SKIP;
         c->flags &= ~CLIENT_REPLY_SKIP_NEXT;
     }
+
+    c->net_input_bytes_curr_cmd = 0;
+    c->net_output_bytes_curr_cmd = 0;
 }
 
 /* resetClient prepare the client to process the next command */
@@ -2433,6 +2444,22 @@ int processInlineBuffer(client *c) {
         c->argv_len_sum += sdslen(argv[j]);
     }
     zfree(argv);
+
+    /* Per-slot network bytes-in calculation.
+     *
+     * We calculate and store the current command's ingress bytes under
+     * c->net_input_bytes_curr_cmd, for which its per-slot aggregation is deferred
+     * until c->slot is parsed later within processCommand().
+     *
+     * Calculation: For inline buffer, every whitespace is of length 1,
+     * with the exception of the trailing '\r\n' being length 2.
+     *
+     * For example;
+     * Command) SET key value
+     * Inline) SET key value\r\n
+     */
+    c->net_input_bytes_curr_cmd = (c->argv_len_sum + (c->argc - 1) + 2);
+
     return C_OK;
 }
 
@@ -2506,6 +2533,7 @@ int processMultibulkBuffer(client *c) {
         /* We know for sure there is a whole line since newline != NULL,
          * so go ahead and find out the multi bulk length. */
         serverAssertWithInfo(c,NULL,c->querybuf[c->qb_pos] == '*');
+        size_t multibulklen_slen = newline - (c->querybuf + 1 + c->qb_pos);
         ok = string2ll(c->querybuf+1+c->qb_pos,newline-(c->querybuf+1+c->qb_pos),&ll);
         if (!ok || ll > INT_MAX) {
             c->read_error = CLIENT_READ_INVALID_MULTIBUCK_LENGTH;
@@ -2533,6 +2561,39 @@ int processMultibulkBuffer(client *c) {
             c->argv = zmalloc(sizeof(robj*)*c->argv_len);
         }
         c->argv_len_sum = 0;
+
+        /* Per-slot network bytes-in calculation.
+         *
+         * We calculate and store the current command's ingress bytes under
+         * c->net_input_bytes_curr_cmd, for which its per-slot aggregation is deferred
+         * until c->slot is parsed later within processCommand().
+         *
+         * Calculation: For multi bulk buffer, we accumulate four factors, namely;
+         *
+         * 1) multibulklen_slen + 3
+         *    Cumulative string length (and not the value of) of multibulklen,
+         *    including the first "*" byte and last "\r\n" 2 bytes from RESP.
+         * 2) bulklen_slen + 3
+         *    Cumulative string length (and not the value of) of bulklen,
+         *    including +3 from RESP first "$" byte and last "\r\n" 2 bytes per argument count.
+         * 3) c->argv_len_sum
+         *    Cumulative string length of all argument vectors.
+         * 4) c->argc * 2
+         *    Cumulative string length of the arguments' white-spaces, for which there exists a total of
+         *    "\r\n" 2 bytes per argument.
+         *
+         * For example;
+         * Command) SET key value
+         * RESP) *3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
+         *
+         * 1) String length of "*3\r\n" is 4, obtained from (multibulklen_slen + 3).
+         * 2) String length of "$3\r\n" "$3\r\n" "$5\r\n" is 12, obtained from (bulklen_slen + 3).
+         * 3) String length of "SET" "key" "value" is 11, obtained from (c->argv_len_sum).
+         * 4) String length of the 3 arguments' white-spaces "\r\n" is 6, obtained from (c->argc * 2).
+         *
+         * The 1st component is calculated within the below line.
+         * */
+        c->net_input_bytes_curr_cmd += (multibulklen_slen + 3);
     }
 
     serverAssertWithInfo(c,NULL,c->multibulklen > 0);
@@ -2557,6 +2618,7 @@ int processMultibulkBuffer(client *c) {
                 return C_ERR;
             }
 
+            size_t bulklen_slen = newline - (c->querybuf + c->qb_pos + 1);
             ok = string2ll(c->querybuf+c->qb_pos+1,newline-(c->querybuf+c->qb_pos+1),&ll);
             if (!ok || ll < 0 ||
                 (!(c->flags & CLIENT_MASTER) && ll > server.proto_max_bulk_len)) {
@@ -2596,6 +2658,8 @@ int processMultibulkBuffer(client *c) {
                 }
             }
             c->bulklen = ll;
+            /* Per-slot network bytes-in calculation, 2nd component. */
+            c->net_input_bytes_curr_cmd += (bulklen_slen + 3);
         }
 
         /* Read bulk argument */
@@ -2620,9 +2684,13 @@ int processMultibulkBuffer(client *c) {
                 c->argv[c->argc++] = createObject(OBJ_STRING,c->querybuf);
                 c->argv_len_sum += c->bulklen;
                 sdsIncrLen(c->querybuf,-2); /* remove CRLF */
-                /* Assume that if we saw a fat argument we'll see another one
-                 * likely... */
-                c->querybuf = sdsnewlen(SDS_NOINIT,c->bulklen+2);
+                /* Assume that if we saw a fat argument we'll see another one likely...
+                 * But only if that fat argument is not too big compared to the memory limit. */
+                if (!server.maxmemory || (size_t)c->bulklen < server.maxmemory / 32) {
+                    c->querybuf = sdsnewlen(SDS_NOINIT,c->bulklen+2);
+                } else {
+                    c->querybuf = sdsnewlen(SDS_NOINIT, PROTO_IOBUF_LEN);
+                }
                 sdsclear(c->querybuf);
                 querybuf_len = sdslen(c->querybuf); /* Update cached length */
             } else {
@@ -2637,7 +2705,11 @@ int processMultibulkBuffer(client *c) {
     }
 
     /* We're done when c->multibulk == 0 */
-    if (c->multibulklen == 0) return C_OK;
+    if (c->multibulklen == 0) {
+        /* Per-slot network bytes-in calculation, 3rd and 4th components. */
+        c->net_input_bytes_curr_cmd += (c->argv_len_sum + (c->argc * 2));
+        return C_OK;
+    }
 
     /* Still not ready to process the command */
     return C_ERR;
@@ -2659,6 +2731,7 @@ void commandProcessed(client *c) {
     if (c->flags & CLIENT_BLOCKED) return;
 
     reqresAppendResponse(c);
+    clusterSlotStatsAddNetworkBytesInForUserClient(c);
     resetClientInternal(c, 0);
 
     long long prev_offset = c->reploff;
@@ -2877,6 +2950,11 @@ int processInputBuffer(client *c) {
             if (c->running_tid != IOTHREAD_MAIN_THREAD_ID) {
                 c->io_flags |= CLIENT_IO_PENDING_COMMAND;
                 c->iolookedcmd = lookupCommand(c->argv, c->argc);
+                if (c->iolookedcmd && !commandCheckArity(c->iolookedcmd, c->argc, NULL)) {
+                    /* The command was found, but the arity is invalid, reset it and let main
+                     * thread handle. To avoid memory prefetching on an invalid command. */
+                    c->iolookedcmd = NULL;
+                }
                 c->slot = getSlotFromCommand(c->iolookedcmd, c->argv, c->argc);
                 enqueuePendingClientsToMainThread(c, 0);
                 break;
@@ -3638,11 +3716,12 @@ NULL
         if (getLongLongFromObjectOrReply(c,c->argv[2],&id,NULL)
             != C_OK) return;
         struct client *target = lookupClientByID(id);
-        /* Note that we never try to unblock a client blocked on a module command, which
+        /* Note that we never try to unblock a client blocked on a module command,
+         * or a client blocked by CLIENT PAUSE or some other blocking type which
          * doesn't have a timeout callback (even in the case of UNBLOCK ERROR).
          * The reason is that we assume that if a command doesn't expect to be timedout,
          * it also doesn't expect to be unblocked by CLIENT UNBLOCK */
-        if (target && target->flags & CLIENT_BLOCKED && moduleBlockedClientMayTimeout(target)) {
+        if (target && target->flags & CLIENT_BLOCKED && blockedClientMayTimeout(target)) {
             if (unblock_error)
                 unblockClientOnError(target,
                     "-UNBLOCKED client unblocked via CLIENT UNBLOCK");
